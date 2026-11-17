@@ -1,0 +1,60 @@
+name: Tumbleweed install
+
+on:
+  push:
+    branches:
+      - test/eb-26.18-ci
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  tumbleweed:
+    runs-on: ubuntu-latest
+    container: opensuse/tumbleweed
+    steps:
+      - name: Base tools
+        run: zypper --non-interactive install findutils tar gzip
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-upgrade
+          path: up
+          run-id: "44138302762"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-shipped
+          path: sh
+          run-id: "44138302762"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install, compare launch, remove
+        shell: bash
+        run: |
+          set -euxo pipefail
+          f=$(find "$PWD/up" -name '*.rpm' | head -1)
+          zypper --non-interactive --no-gpg-checks install --allow-unsigned-rpm "$f" xvfb-run dbus-1 libasound2 procps which
+          rpm -q hydralauncher
+          files=$(rpm -ql hydralauncher)
+          exe=$(echo "$files" | grep -E '^/opt/[^/]+/hydralauncher$')
+          test -x "$exe"
+          echo "$files" | grep -E '/usr/share/applications/.*\.desktop$'
+          ls -l /usr/bin/hydralauncher "$(dirname "$exe")/chrome-sandbox"
+          missing=$(ldd "$exe" | grep "not found" || true)
+          echo "missing libs: ${missing:-none}"
+          mkdir -p /t && tar -C /t -xzf "$(find sh -name linux-unpacked.tgz)"
+          results=""
+          for target in /t/linux-unpacked/hydralauncher "$exe"; do
+            rm -rf /root/.config/hydralauncher /root/.config/Hydra
+            set +e
+            dbus-run-session -- xvfb-run -a timeout 30 "$target" --no-sandbox > launch.log 2>&1
+            code=$?
+            set -e
+            echo "#### $target exit=$code (124 = still running after 30s)"
+            results="$results $code"
+          done
+          echo "exit codes shipped/upgraded:$results"
+          zypper --non-interactive remove hydralauncher
+          test ! -e "$exe"
+          test -z "$missing"
+          test "$results" = " 124 124"
