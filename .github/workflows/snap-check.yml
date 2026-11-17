@@ -1,0 +1,32 @@
+name: Snap check
+
+on:
+  push:
+    branches:
+      - test/eb-26.18-ci
+
+jobs:
+  snap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.21.0
+          cache: "yarn"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Prerequisites
+        run: |
+          rustup target add x86_64-pc-windows-gnu
+          sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build pkg-config curl zip unzip tar autoconf automake libtool gcc-mingw-w64-x86-64 squashfs-tools
+      - run: yarn --frozen-lockfile
+      - name: Build snap only
+        run: yarn build:linux snap > "$RUNNER_TEMP/build.log" 2>&1 || { tail -40 "$RUNNER_TEMP/build.log"; exit 1; }
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Inspect snap.yaml
+        run: |
+          ls -l dist/*.snap
+          unsquashfs -d "$RUNNER_TEMP/snapx" dist/*.snap meta/snap.yaml > /dev/null
+          sed -n '/environment:/,/^[a-z]/p' "$RUNNER_TEMP/snapx/meta/snap.yaml"
+          grep -q "DISABLE_WAYLAND: '1'" "$RUNNER_TEMP/snapx/meta/snap.yaml" && echo "DISABLE_WAYLAND present" || { echo "DISABLE_WAYLAND missing"; exit 1; }
