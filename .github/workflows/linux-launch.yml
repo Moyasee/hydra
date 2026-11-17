@@ -1,4 +1,4 @@
-name: Linux launch compare
+name: Linux launch bisect
 
 on:
   push:
@@ -13,53 +13,6 @@ env:
   FIRST_RUN: "44128364972"
 
 jobs:
-  container:
-    strategy:
-      fail-fast: false
-      matrix:
-        distro: ["ubuntu:26.04", "fedora:43"]
-    runs-on: ubuntu-latest
-    container: ${{ matrix.distro }}
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: packages-linux-upgrade
-          path: up
-          run-id: ${{ env.FIRST_RUN }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/download-artifact@v4
-        with:
-          name: unpacked-linux-shipped
-          path: sh
-          run-id: ${{ env.FIRST_RUN }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Deps
-        shell: bash
-        run: |
-          set -eux
-          if command -v dnf; then
-            dnf install -y "$(find $PWD/up -name '*.rpm')" xorg-x11-server-Xvfb xorg-x11-xauth dbus-daemon dbus-tools alsa-lib mesa-dri-drivers tar gzip procps-ng
-          else
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update
-            apt-get install -y "$(find $PWD/up -name '*.deb')" xvfb xauth dbus dbus-x11 libasound2t64 libgl1-mesa-dri procps
-          fi
-          mkdir -p /t/shipped /t/upgrade
-          tar -C /t/shipped -xzf "$(find sh -name linux-unpacked.tgz)"
-          tar -C /t/upgrade -xzf "$(find up -name linux-unpacked.tgz)"
-      - name: Launch
-        shell: bash
-        run: |
-          for target in /t/shipped/linux-unpacked/hydralauncher /t/upgrade/linux-unpacked/hydralauncher /opt/Hydra/hydralauncher; do
-            rm -rf /root/.config/hydralauncher /root/.config/Hydra
-            set +e
-            ELECTRON_ENABLE_LOGGING=1 dbus-run-session -- xvfb-run -a timeout 40 "$target" --no-sandbox > launch.log 2>&1
-            code=$?
-            set -e
-            echo "################ $target exit=$code (124 = still running after 40s)"
-            grep -v -E "dbus/bus.cc|Failed to connect to the bus" launch.log | head -60
-          done
-
   host:
     runs-on: ubuntu-latest
     steps:
@@ -75,19 +28,28 @@ jobs:
           path: sh
           run-id: ${{ env.FIRST_RUN }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Launch on runner host
+      - name: Bisect
         run: |
-          sudo apt-get update && sudo apt-get install -y xvfb libfuse2t64
+          sudo apt-get update && sudo apt-get install -y xvfb
           mkdir -p t/shipped t/upgrade
           tar -C t/shipped -xzf "$(find sh -name linux-unpacked.tgz)"
           tar -C t/upgrade -xzf "$(find up -name linux-unpacked.tgz)"
-          app=$(find "$PWD/up" -name '*.AppImage'); chmod +x "$app"
-          for target in "$PWD/t/shipped/linux-unpacked/hydralauncher" "$PWD/t/upgrade/linux-unpacked/hydralauncher" "$app"; do
+          S=t/shipped/linux-unpacked; U=t/upgrade/linux-unpacked
+          CL=resources/app.asar.unpacked/node_modules/classic-level/build/Release/classic_level.node
+          HN=resources/hydra-native/hydra-native.node
+          mk() { rm -rf "t/$1"; cp -a "$2" "t/$1"; }
+          mk s-asarU $S; cp $U/resources/app.asar t/s-asarU/resources/app.asar
+          mk s-clU $S; cp $U/$CL t/s-clU/$CL
+          mk s-hnU $S; cp $U/$HN t/s-hnU/$HN
+          mk u-asarS $U; cp $S/resources/app.asar t/u-asarS/resources/app.asar
+          mk u-clS $U; cp $S/$CL t/u-clS/$CL
+          for d in shipped/linux-unpacked upgrade/linux-unpacked s-asarU s-clU s-hnU u-asarS u-clS; do
             rm -rf ~/.config/hydralauncher ~/.config/Hydra
             set +e
-            ELECTRON_ENABLE_LOGGING=1 xvfb-run -a timeout 40 "$target" --no-sandbox > launch.log 2>&1
+            ELECTRON_ENABLE_LOGGING=1 xvfb-run -a timeout 30 "$PWD/t/$d/hydralauncher" --no-sandbox > launch.log 2>&1
             code=$?
             set -e
-            echo "################ $target exit=$code (124 = still running after 40s)"
-            head -60 launch.log
+            echo "################ $d exit=$code"
+            grep -v -E "dbus|^$" launch.log | head -15
+            for f in $(find ~/.config -name '*.log' 2>/dev/null); do echo "---- $f"; tail -25 "$f"; done
           done
