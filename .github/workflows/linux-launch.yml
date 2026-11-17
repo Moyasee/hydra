@@ -1,0 +1,93 @@
+name: Linux launch compare
+
+on:
+  push:
+    branches:
+      - test/eb-26.18-ci
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  FIRST_RUN: "44128364972"
+
+jobs:
+  container:
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: ["ubuntu:26.04", "fedora:43"]
+    runs-on: ubuntu-latest
+    container: ${{ matrix.distro }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages-linux-upgrade
+          path: up
+          run-id: ${{ env.FIRST_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: unpacked-linux-shipped
+          path: sh
+          run-id: ${{ env.FIRST_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Deps
+        shell: bash
+        run: |
+          set -eux
+          if command -v dnf; then
+            dnf install -y "$(find $PWD/up -name '*.rpm')" xorg-x11-server-Xvfb xorg-x11-xauth dbus-daemon dbus-tools alsa-lib mesa-dri-drivers tar gzip procps-ng
+          else
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y "$(find $PWD/up -name '*.deb')" xvfb xauth dbus dbus-x11 libasound2t64 libgl1-mesa-dri procps
+          fi
+          mkdir -p /t/shipped /t/upgrade
+          tar -C /t/shipped -xzf "$(find sh -name linux-unpacked.tgz)"
+          tar -C /t/upgrade -xzf "$(find up -name linux-unpacked.tgz)"
+      - name: Launch
+        shell: bash
+        run: |
+          for target in /t/shipped/linux-unpacked/hydralauncher /t/upgrade/linux-unpacked/hydralauncher /opt/Hydra/hydralauncher; do
+            rm -rf /root/.config/hydralauncher /root/.config/Hydra
+            set +e
+            ELECTRON_ENABLE_LOGGING=1 dbus-run-session -- xvfb-run -a timeout 40 "$target" --no-sandbox > launch.log 2>&1
+            code=$?
+            set -e
+            echo "################ $target exit=$code (124 = still running after 40s)"
+            grep -v -E "dbus/bus.cc|Failed to connect to the bus" launch.log | head -60
+          done
+
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages-linux-upgrade
+          path: up
+          run-id: ${{ env.FIRST_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: unpacked-linux-shipped
+          path: sh
+          run-id: ${{ env.FIRST_RUN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Launch on runner host
+        run: |
+          sudo apt-get update && sudo apt-get install -y xvfb libfuse2t64
+          mkdir -p t/shipped t/upgrade
+          tar -C t/shipped -xzf "$(find sh -name linux-unpacked.tgz)"
+          tar -C t/upgrade -xzf "$(find up -name linux-unpacked.tgz)"
+          app=$(find "$PWD/up" -name '*.AppImage'); chmod +x "$app"
+          for target in "$PWD/t/shipped/linux-unpacked/hydralauncher" "$PWD/t/upgrade/linux-unpacked/hydralauncher" "$app"; do
+            rm -rf ~/.config/hydralauncher ~/.config/Hydra
+            set +e
+            ELECTRON_ENABLE_LOGGING=1 xvfb-run -a timeout 40 "$target" --no-sandbox > launch.log 2>&1
+            code=$?
+            set -e
+            echo "################ $target exit=$code (124 = still running after 40s)"
+            head -60 launch.log
+          done
