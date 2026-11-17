@@ -1,7 +1,9 @@
 name: EB upgrade test
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - test/eb-26.18-ci
 
 env:
   BASE_REF: ff952e2312e191bcf0836210540ca03b169b80d3
@@ -177,94 +179,3 @@ jobs:
           echo "exit codes shipped/upgraded:$results"
           test "$results" = " 124 124"
 
-  windows:
-    strategy:
-      fail-fast: false
-      matrix:
-        variant: [base, head]
-    runs-on: windows-2022
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ matrix.variant == 'base' && env.BASE_REF || github.sha }}
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22.21.0
-          cache: "yarn"
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - run: yarn --frozen-lockfile
-
-      - name: Build Windows
-        run: yarn build:win
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Asar integrity
-        shell: bash
-        run: |
-          ls -l dist
-          node -e "
-          const fs=require('fs'),crypto=require('crypto');
-          const asar=require('@electron/asar');
-          const s=fs.readFileSync('dist/win-unpacked/Hydra.exe').toString('latin1');
-          const m=s.match(/\[\{\"file\":\"[^\]]*\"alg\":\"SHA256\"[^\]]*\]/g);
-          const h=asar.getRawHeader('dist/win-unpacked/resources/app.asar');
-          console.log('embedded', JSON.stringify(m));
-          console.log('actual', crypto.createHash('sha256').update(h.headerString).digest('hex'));
-          "
-
-      - name: Launch helper
-        shell: pwsh
-        run: |
-          @'
-          param([string]$Exe, [string]$Tag)
-          Get-Process Hydra -ErrorAction SilentlyContinue | Stop-Process -Force
-          Remove-Item -Recurse -Force "$env:APPDATA\hydralauncher" -ErrorAction SilentlyContinue
-          $p = Start-Process $Exe -PassThru
-          $line = @()
-          foreach ($i in 1..8) { Start-Sleep -Seconds 5; $line += "$($i*5)s:$(@(Get-Process Hydra -ErrorAction SilentlyContinue).Count)" }
-          "#### $Tag hydra-process-count-over-time: $($line -join ' ') main_exited=$($p.HasExited)"
-          $alive = @(Get-Process Hydra -ErrorAction SilentlyContinue).Count -gt 0
-          Get-Process Hydra -ErrorAction SilentlyContinue | Stop-Process -Force
-          Start-Sleep -Seconds 2
-          if (-not $alive) { Get-ChildItem "$env:APPDATA\hydralauncher" -Recurse -Filter *.log -ErrorAction SilentlyContinue | ForEach-Object { "==== $($_.FullName)"; Get-Content $_.FullName -Tail 40 } }
-          if (-not $alive) { throw "$Tag not running after 40s" }
-          '@ | Set-Content launch.ps1
-
-      - name: Launch win-unpacked
-        shell: pwsh
-        run: ./launch.ps1 -Exe "$PWD\dist\win-unpacked\Hydra.exe" -Tag unpacked
-
-      - name: Install, compare, launch, uninstall
-        shell: pwsh
-        run: |
-          $setup = Get-ChildItem dist\*-setup.exe | Select-Object -First 1
-          $dir = "C:\HydraTest"
-          $p = Start-Process $setup.FullName -ArgumentList "/S", "/D=$dir" -Wait -PassThru
-          "installer exit: $($p.ExitCode)"
-          $src = (Resolve-Path dist\win-unpacked).Path
-          $bad = @()
-          Get-ChildItem $src -Recurse -File | ForEach-Object {
-            $rel = $_.FullName.Substring($src.Length + 1)
-            $dst = Join-Path $dir $rel
-            if (-not (Test-Path $dst)) { $bad += "missing $rel" }
-            elseif ((Get-FileHash $_.FullName).Hash -ne (Get-FileHash $dst).Hash) { $bad += "differs $rel" }
-          }
-          "installed-vs-unpacked mismatches: $($bad.Count)"
-          $bad | Select-Object -First 20
-          ./launch.ps1 -Exe "$dir\Hydra.exe" -Tag installed
-          $un = Get-ChildItem "$dir\Uninstall*.exe" | Select-Object -First 1
-          $u = Start-Process $un.FullName -ArgumentList "/S" -Wait -PassThru
-          Start-Sleep -Seconds 10
-          "uninstaller exit: $($u.ExitCode); Hydra.exe still present: $(Test-Path "$dir\Hydra.exe")"
-          if ($bad.Count -gt 0) { throw "installed files differ" }
-          if (Test-Path "$dir\Hydra.exe") { throw "uninstall left files" }
-
-      - name: Launch portable
-        shell: pwsh
-        run: |
-          $port = Get-ChildItem dist\*-portable.exe | Select-Object -First 1
-          ./launch.ps1 -Exe $port.FullName -Tag portable

@@ -1,9 +1,7 @@
 name: Tumbleweed install
 
 on:
-  push:
-    branches:
-      - test/eb-26.18-ci
+  workflow_dispatch:
 
 permissions:
   actions: read
