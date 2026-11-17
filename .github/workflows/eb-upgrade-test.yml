@@ -1,0 +1,371 @@
+name: EB upgrade test
+
+on:
+  push:
+    branches:
+      - test/eb-26.18-ci
+
+env:
+  BASE_REF: ff952e2312e191bcf0836210540ca03b169b80d3
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: shipped
+            runner: ubuntu-24.04
+            ref: base
+            system_fpm: "false"
+          - variant: pr3151
+            runner: ubuntu-latest
+            ref: base
+            system_fpm: "true"
+          - variant: upgrade
+            runner: ubuntu-latest
+            ref: head
+            system_fpm: "false"
+          - variant: upgrade-xz9
+            runner: ubuntu-latest
+            ref: head
+            system_fpm: "false"
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref == 'base' && env.BASE_REF || github.sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.21.0
+          cache: "yarn"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Environment
+        run: |
+          echo "image=$ImageOS-$ImageVersion"
+          rpm --version
+          git log --oneline -1
+          grep '"electron-builder"' package.json
+
+      - name: Check prebuilt torrent bridge
+        run: node scripts/torrent-bridge-prebuilt.cjs check
+
+      - name: Prerequisites
+        run: |
+          rustup target add x86_64-pc-windows-gnu
+          sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build pkg-config curl zip unzip tar autoconf automake libtool gcc-mingw-w64-x86-64 squashfs-tools
+          if [ "${{ matrix.system_fpm }}" = "true" ]; then sudo gem install --no-document fpm -v 1.17.0; fi
+
+      - run: yarn --frozen-lockfile
+
+      - name: Deb compression level 9
+        if: matrix.variant == 'upgrade-xz9'
+        run: |
+          printf 'deb:\n  fpm:\n    - --deb-compression-level=9\n' >> electron-builder.yml
+          tail -4 electron-builder.yml
+
+      - name: Build Linux
+        run: |
+          if [ "${{ matrix.system_fpm }}" = "true" ]; then export USE_SYSTEM_FPM=true; fi
+          yarn build:linux 2>&1 | tee build.log
+          exit "${PIPESTATUS[0]}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Manifests
+        if: always()
+        run: |
+          set -x
+          m=manifest/${{ matrix.variant }}
+          mkdir -p "$m"
+          cp build.log "$m/" || true
+          ls -l dist > "$m/dist-ls.txt" || true
+          cp dist/*.yml "$m/" || true
+          grep -E "fpm|downloading|building|⨯" build.log > "$m/build-grep.txt" || true
+          rpmf=$(ls dist/*.rpm 2>/dev/null | head -1)
+          if [ -n "$rpmf" ]; then
+            rpm -qip "$rpmf" > "$m/rpm-info.txt"
+            rpm -qp --requires "$rpmf" | sort > "$m/rpm-requires.txt"
+            rpm -qp --provides "$rpmf" | sort > "$m/rpm-provides.txt"
+            rpm -qp --scripts "$rpmf" > "$m/rpm-scripts.txt"
+            rpm -qp --dump "$rpmf" | awk '{print $1, $2, $5, $6, $7, $4}' | sort > "$m/rpm-dump.txt"
+          fi
+          debf=$(ls dist/*.deb 2>/dev/null | head -1)
+          if [ -n "$debf" ]; then
+            dpkg-deb -I "$debf" > "$m/deb-info.txt"
+            dpkg-deb -c "$debf" | awk '{print $1, $2, $3, $6}' | sort -k4 > "$m/deb-contents.txt"
+            mkdir -p /tmp/debctl && dpkg-deb -e "$debf" /tmp/debctl && for f in /tmp/debctl/*; do echo "== $f"; cat "$f"; done > "$m/deb-control.txt"
+            mkdir -p /tmp/debx && dpkg-deb -x "$debf" /tmp/debx && (cd /tmp/debx && find . -type f -exec sha256sum {} + | sort -k2) > "$m/deb-sha.txt"
+          fi
+          appf=$(ls dist/*.AppImage 2>/dev/null | head -1)
+          if [ -n "$appf" ]; then
+            chmod +x "$appf"
+            (cd /tmp && "$GITHUB_WORKSPACE/$appf" --appimage-extract > /dev/null)
+            (cd /tmp/squashfs-root && find . -printf '%y %m %s %P\n' | sort -k4) > "$m/appimage-tree.txt"
+            (cd /tmp/squashfs-root && find . -type f -exec sha256sum {} + | sort -k2) > "$m/appimage-sha.txt"
+            head -c 2000 /tmp/squashfs-root/AppRun > "$m/appimage-apprun.txt" || true
+            cat /tmp/squashfs-root/*.desktop > "$m/appimage-desktop.txt" || true
+            file "$appf" > "$m/appimage-file.txt"
+          fi
+          snapf=$(ls dist/*.snap 2>/dev/null | head -1)
+          if [ -n "$snapf" ]; then
+            unsquashfs -lls "$snapf" | awk '{print $1, $3, $6}' | sort -k3 > "$m/snap-tree.txt"
+            unsquashfs -d /tmp/snapx "$snapf" meta > /dev/null && cat /tmp/snapx/meta/snap.yaml > "$m/snap-yaml.txt"
+            ls -R /tmp/snapx/meta >> "$m/snap-yaml.txt"
+          fi
+          if [ -d dist/linux-unpacked ]; then
+            (cd dist/linux-unpacked && find . -type f -exec sha256sum {} + | sort -k2) > "$m/unpacked-sha.txt"
+            npx --yes @electron/asar list dist/linux-unpacked/resources/app.asar | sort > "$m/asar-list.txt" || true
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: manifest-linux-${{ matrix.variant }}
+          path: manifest
+          retention-days: 3
+
+      - name: Pack unpacked dir
+        if: matrix.variant != 'pr3151'
+        run: tar -C dist -czf linux-unpacked.tgz linux-unpacked
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.variant == 'upgrade'
+        with:
+          name: packages-linux-upgrade
+          path: |
+            dist/*.rpm
+            dist/*.deb
+            dist/*.AppImage
+            dist/*.snap
+            linux-unpacked.tgz
+          compression-level: 0
+          retention-days: 3
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.variant == 'shipped'
+        with:
+          name: unpacked-linux-shipped
+          path: linux-unpacked.tgz
+          compression-level: 0
+          retention-days: 3
+
+  install:
+    needs: linux
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: fedora:43
+            kind: rpm
+          - distro: opensuse/tumbleweed
+            kind: rpm
+          - distro: ubuntu:26.04
+            kind: deb
+          - distro: ubuntu:24.04
+            kind: deb
+          - distro: debian:13
+            kind: deb
+    runs-on: ubuntu-latest
+    container: ${{ matrix.distro }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages-linux-upgrade
+          path: pkgs
+
+      - name: Install, check, launch, remove
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ls -l pkgs
+          if [ "${{ matrix.kind }}" = "rpm" ]; then
+            f=$(ls pkgs/*.rpm)
+            if command -v dnf; then dnf install -y "$f" xorg-x11-server-Xvfb xorg-x11-xauth procps-ng which findutils; fi
+            if command -v zypper; then zypper --non-interactive --no-gpg-checks install --allow-unsigned-rpm "$f" xvfb-run procps which findutils; fi
+            files=$(rpm -ql hydralauncher)
+            pkgver=$(rpm -q hydralauncher)
+          else
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y "./$(ls pkgs/*.deb)" xvfb xauth procps
+            files=$(dpkg -L hydralauncher)
+            pkgver=$(dpkg -s hydralauncher | grep Version)
+          fi
+          echo "$pkgver"
+          exe=$(echo "$files" | grep -E '^/opt/[^/]+/hydralauncher$')
+          test -x "$exe"
+          echo "$files" | grep -E '/usr/share/applications/.*\.desktop$'
+          echo "$files" | grep -E '/usr/share/icons/'
+          test -e /usr/bin/hydralauncher && ls -l /usr/bin/hydralauncher
+          ls -l "$(dirname "$exe")/chrome-sandbox"
+          missing=$(ldd "$exe" | grep "not found" || true)
+          echo "missing libs: ${missing:-none}"
+          test -z "$missing"
+          for so in "$(dirname "$exe")"/*.so* "$(dirname "$exe")"/resources/hydra-native/*.node; do [ -e "$so" ] || continue; m=$(ldd "$so" | grep "not found" || true); [ -z "$m" ] || { echo "$so: $m"; exit 1; }; done
+          set +e
+          xvfb-run -a timeout 30 "$exe" --no-sandbox > launch.log 2>&1
+          code=$?
+          set -e
+          tail -40 launch.log
+          echo "launch exit code: $code (124 means still running after 30s)"
+          test "$code" = "124"
+          if [ "${{ matrix.kind }}" = "rpm" ]; then
+            if command -v dnf; then dnf remove -y hydralauncher; else zypper --non-interactive remove hydralauncher; fi
+          else
+            apt-get remove -y hydralauncher
+          fi
+          test ! -e "$exe"
+
+  appimage-launch:
+    needs: linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages-linux-upgrade
+          path: pkgs
+      - name: Launch AppImage
+        run: |
+          sudo apt-get update && sudo apt-get install -y xvfb libfuse2t64 || sudo apt-get install -y xvfb libfuse2
+          f=$(ls pkgs/*.AppImage)
+          chmod +x "$f"
+          set +e
+          xvfb-run -a timeout 30 "$f" --no-sandbox > launch.log 2>&1
+          code=$?
+          set -e
+          tail -40 launch.log
+          echo "launch exit code: $code"
+          test "$code" = "124"
+
+  fedora-local:
+    needs: linux
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: base
+          - variant: head
+    runs-on: ubuntu-latest
+    container: fedora:43
+    steps:
+      - name: Tools
+        run: dnf install -y git nodejs22 nodejs22-npm rpm-build rpmdevtools xz tar findutils libxcrypt-compat
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.variant == 'base' && env.BASE_REF || github.sha }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.variant == 'base' && 'unpacked-linux-shipped' || 'packages-linux-upgrade' }}
+          path: art
+
+      - name: Local rpm + deb build on Fedora 43
+        shell: bash
+        run: |
+          set -x
+          rpm --version
+          node --version
+          mkdir -p dist && tar -C dist -xzf art/linux-unpacked.tgz
+          corepack enable || npm i -g yarn@1.22.22
+          yarn --frozen-lockfile --ignore-scripts
+          npx electron-builder --version
+          set +e
+          npx electron-builder --linux rpm deb --x64 --prepackaged dist/linux-unpacked -c.beforePack=null -c.afterPack=null -c.afterSign=null --publish never 2>&1 | tee repack.log
+          code=${PIPESTATUS[0]}
+          echo "electron-builder exit code: $code"
+          ls -l dist/*.rpm dist/*.deb
+          if [ "${{ matrix.variant }}" = "head" ]; then test "$code" = "0"; else test "$code" != "0"; fi
+
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [base, head]
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.variant == 'base' && env.BASE_REF || github.sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.21.0
+          cache: "yarn"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check prebuilt torrent bridge
+        run: node scripts/torrent-bridge-prebuilt.cjs check
+
+      - run: yarn --frozen-lockfile
+
+      - name: Build Windows
+        shell: bash
+        run: |
+          yarn build:win 2>&1 | tee build.log
+          exit "${PIPESTATUS[0]}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Manifests
+        if: always()
+        shell: bash
+        run: |
+          m=manifest/win-${{ matrix.variant }}
+          mkdir -p "$m"
+          cp build.log "$m/" || true
+          ls -l dist > "$m/dist-ls.txt" || true
+          cp dist/*.yml "$m/" || true
+          (cd dist/win-unpacked && find . -type f -exec sha256sum {} + | sort -k2) > "$m/unpacked-sha.txt" || true
+          npx --yes @electron/asar list dist/win-unpacked/resources/app.asar | sort > "$m/asar-list.txt" || true
+          setup=$(ls dist/*-setup.exe | head -1)
+          7z l "$setup" > "$m/nsis-7z-list.txt" || true
+
+      - name: Install, launch, uninstall
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem dist\*-setup.exe | Select-Object -First 1
+          $dir = "C:\HydraTest"
+          $p = Start-Process $setup.FullName -ArgumentList "/S", "/D=$dir" -Wait -PassThru
+          "installer exit: $($p.ExitCode)"
+          Get-ChildItem $dir | Select-Object Name, Length | Format-Table | Out-String | Write-Output
+          if (-not (Test-Path "$dir\Hydra.exe")) { throw "Hydra.exe missing" }
+          $reg = Get-ChildItem HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall, HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall -ErrorAction SilentlyContinue | Get-ItemProperty | Where-Object DisplayName -like "Hydra*"
+          $reg | Select-Object DisplayName, DisplayVersion, InstallLocation, UninstallString | Format-List | Out-String | Write-Output
+          $app = Start-Process "$dir\Hydra.exe" -PassThru
+          Start-Sleep -Seconds 30
+          $alive = -not $app.HasExited
+          "alive after 30s: $alive"
+          Get-Process Hydra -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 3
+          $un = Get-ChildItem "$dir\Uninstall*.exe" | Select-Object -First 1
+          $u = Start-Process $un.FullName -ArgumentList "/S" -Wait -PassThru
+          Start-Sleep -Seconds 10
+          "uninstaller exit: $($u.ExitCode)"
+          "Hydra.exe still present: $(Test-Path "$dir\Hydra.exe")"
+          if (-not $alive) { throw "app exited within 30s" }
+          if (Test-Path "$dir\Hydra.exe") { throw "uninstall left Hydra.exe" }
+
+      - name: Portable launch
+        shell: pwsh
+        run: |
+          $port = Get-ChildItem dist\*-portable.exe | Select-Object -First 1
+          $app = Start-Process $port.FullName -PassThru
+          Start-Sleep -Seconds 40
+          $procs = Get-Process Hydra -ErrorAction SilentlyContinue
+          "Hydra processes after 40s: $($procs.Count)"
+          $procs | Stop-Process -Force
+          Get-Process | Where-Object { $_.Path -like "*Hydra*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+          if (-not $procs) { throw "portable build not running after 40s" }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: manifest-win-${{ matrix.variant }}
+          path: manifest
+          retention-days: 3
