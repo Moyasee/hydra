@@ -16,6 +16,9 @@ jobs:
   host:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.21.0
       - uses: actions/download-artifact@v4
         with:
           name: packages-linux-upgrade
@@ -28,28 +31,60 @@ jobs:
           path: sh
           run-id: ${{ env.FIRST_RUN }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Bisect
+      - name: Prepare
         run: |
           sudo apt-get update && sudo apt-get install -y xvfb
-          mkdir -p t/shipped t/upgrade
+          mkdir -p t/shipped t/upgrade tools
           tar -C t/shipped -xzf "$(find sh -name linux-unpacked.tgz)"
           tar -C t/upgrade -xzf "$(find up -name linux-unpacked.tgz)"
-          S=t/shipped/linux-unpacked; U=t/upgrade/linux-unpacked
-          CL=resources/app.asar.unpacked/node_modules/classic-level/build/Release/classic_level.node
-          HN=resources/hydra-native/hydra-native.node
-          mk() { rm -rf "t/$1"; cp -a "$2" "t/$1"; }
-          mk s-asarU $S; cp $U/resources/app.asar t/s-asarU/resources/app.asar
-          mk s-clU $S; cp $U/$CL t/s-clU/$CL
-          mk s-hnU $S; cp $U/$HN t/s-hnU/$HN
-          mk u-asarS $U; cp $S/resources/app.asar t/u-asarS/resources/app.asar
-          mk u-clS $U; cp $S/$CL t/u-clS/$CL
-          for d in shipped/linux-unpacked upgrade/linux-unpacked s-asarU s-clU s-hnU u-asarS u-clS; do
+          (cd tools && npm init -y > /dev/null && npm i @electron/asar@3.2.18 > /dev/null)
+          cat > tools/hybrid.cjs <<'EOF'
+          const asar = require("@electron/asar");
+          const fs = require("fs");
+          const path = require("path");
+          const [base, outFrom, dest] = process.argv.slice(2);
+          const work = dest + ".src";
+          fs.rmSync(work, { recursive: true, force: true });
+          asar.extractAll(base + "/resources/app.asar", work);
+          if (outFrom) {
+            const other = dest + ".other";
+            fs.rmSync(other, { recursive: true, force: true });
+            asar.extractAll(outFrom + "/resources/app.asar", other);
+            fs.rmSync(path.join(work, "out"), { recursive: true, force: true });
+            fs.cpSync(path.join(other, "out"), path.join(work, "out"), { recursive: true });
+          }
+          fs.rmSync(dest, { recursive: true, force: true });
+          fs.cpSync(base, dest, { recursive: true, verbatimSymlinks: true });
+          fs.rmSync(dest + "/resources/app.asar");
+          fs.rmSync(dest + "/resources/app.asar.unpacked", { recursive: true, force: true });
+          asar
+            .createPackageWithOptions(work, dest + "/resources/app.asar", {
+              unpack: "*.node",
+              unpackDir: "{resources,resources/**,node_modules/sharp,node_modules/sharp/**,node_modules/@img,node_modules/@img/**,node_modules/classic-level,node_modules/classic-level/**}",
+            })
+            .then(() => console.log("packed", dest));
+          EOF
+          node tools/hybrid.cjs t/shipped/linux-unpacked "" t/h0-shipped-repacked
+          node tools/hybrid.cjs t/shipped/linux-unpacked t/upgrade/linux-unpacked t/h1-shipped-with-upgrade-out
+          node tools/hybrid.cjs t/upgrade/linux-unpacked t/shipped/linux-unpacked t/h2-upgrade-with-shipped-out
+          node tools/hybrid.cjs t/upgrade/linux-unpacked "" t/h3-upgrade-repacked
+      - name: Launch
+        run: |
+          for d in shipped/linux-unpacked upgrade/linux-unpacked h0-shipped-repacked h1-shipped-with-upgrade-out h2-upgrade-with-shipped-out h3-upgrade-repacked; do
             rm -rf ~/.config/hydralauncher ~/.config/Hydra
             set +e
             ELECTRON_ENABLE_LOGGING=1 xvfb-run -a timeout 30 "$PWD/t/$d/hydralauncher" --no-sandbox > launch.log 2>&1
             code=$?
             set -e
             echo "################ $d exit=$code"
-            grep -v -E "dbus|^$" launch.log | head -15
-            for f in $(find ~/.config -name '*.log' 2>/dev/null); do echo "---- $f"; tail -25 "$f"; done
+            grep -v -E "dbus|^$|gbm_support|InitializeSandbox|zygote" launch.log | head -8
           done
+      - name: Verbose upgrade launch
+        run: |
+          rm -rf ~/.config/hydralauncher ~/.config/Hydra
+          set +e
+          xvfb-run -a timeout 30 "$PWD/t/upgrade/linux-unpacked/hydralauncher" --no-sandbox --enable-logging=stderr --v=1 > v.log 2>&1
+          echo "exit=$?"
+          grep -i -E "asar|app path|default_app|Error|exit|quit|main" v.log | grep -v -E "dbus" | head -60
+          echo "---- tail"
+          tail -30 v.log
